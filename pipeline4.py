@@ -30,19 +30,19 @@ warnings.filterwarnings("ignore")
 RE_KM = 6371.0
 
 CONSTELLATION_CATALOG = {
-    "STARLINK":          ("STARLINK",),        
+    "STARLINK (LEO)":          ("STARLINK",),        
     "ONEWEB":            ("ONEWEB",),          
     "IRIDIUM":           ("IRIDIUM",),    
-    "PLANET":            ("FLOCK", "PELICAN", "SKYSAT"), # Combined into a single Planet key                   
+    "PLANET (LEO)":            ("FLOCK", "PELICAN", "SKYSAT"), # Combined into a single Planet key                   
     "GALILEO":           ("GALILEO",),        
     # "GLOBALSTAR":        ("GLOBALSTAR",),      # ~1414 km, 52° incl. 
     # "ORBCOMM":           ("ORBCOMM",),         # ~715 km, various incl.
     # "WORLDVIEW":         ("WORLDVIEW",),       # Maxar, ~617 km, 97.9° SSO
     "ISS":               ("ISS (ZARYA)",),     # ~408 km, 51.6° incl. HUMAN CREW
-    "GPS":               ("NAVSTAR",),         # Legacy GPS naming (could also add "GPS IIR" here)
+    "GPS (MEO)":               ("NAVSTAR",),         # Legacy GPS naming (could also add "GPS IIR" here)
     "GLONASS":           ("GLONASS",),         # Russian GNSS, ~19 130 km, 64.8° incl.
     "BEIDOU_MEO":        ("BEIDOU",),          # Chinese GNSS MEO component
-    "INTELSAT":          ("INTELSAT",),        # GEO, 35 786 km, ~0° incl.
+    "INTELSAT (GEO)":          ("INTELSAT",),        # GEO, 35 786 km, ~0° incl.
     # "INMARSAT":          ("INMARSAT",),        # GEO maritime/aero comms
     "MILITARY":          ("USA ",),            # Will match USA-### designations
     "AEHF":              ("AEHF",),            # Advanced EHF (nuclear C2), GEO
@@ -50,13 +50,11 @@ CONSTELLATION_CATALOG = {
 
 CONSTELLATION_SHIELDING = {
     # name_key      : (shield_mm_Al, rad_hard, tid_krad_fail, notes)
-    "STARLINK":        (2.0,  False, 5.0,   "COTS, min shielding"),
+    "STARLINK (LEO)":        (2.0,  False, 5.0,   "COTS, min shielding"),
     "ONEWEB":          (3.0,  False, 10.0,  "COTS LEO broadband"),
     "IRIDIUM":         (3.0,  False, 10.0,  "Commercial LEO"),
-    "PLANET_FLOCK":    (2.5,  False, 5.0,   "COTS cubesat"),
-    "PLANET_PELICAN":  (2.5,  False, 5.0,   "COTS cubesat"),
-    "PLANET_SKYSAT":   (2.5,  False, 5.0,   "COTS cubesat"),
-    "GPS":             (10.0, True,  100.0, "Rad-hardened per MIL-spec"),
+    "PLANET (LEO)":    (2.5,  False, 5.0,   "COTS cubesat"),
+    "GPS (MEO)":             (10.0, True,  100.0, "Rad-hardened per MIL-spec"),
     "GALILEO":         (8.0,  False, 30.0,  "Commercial components, some hardening"),
     "GLOBALSTAR":      (3.0,  False, 10.0,  "Commercial LEO"),
     "ORBCOMM":         (2.0,  False, 5.0,   "COTS IoT LEO"),
@@ -64,7 +62,7 @@ CONSTELLATION_SHIELDING = {
     "BEIDOU_MEO":      (10.0, True,  100.0, "Rad-hardened estimate?"),
     "WORLDVIEW":       (10.0, True,  200.0, "Rad-hardened BAE Systems RAD750 computer"),
     "GLONASS":         (8.0,  True,  75.0,  "Partial hardening"),
-    "INTELSAT":        (8.0,  True,  50.0,  "GEO, designed for belt exposure"),
+    "INTELSAT (GEO)":        (8.0,  True,  50.0,  "GEO, designed for belt exposure"),
     "INMARSAT":        (8.0,  True,  50.0,  "GEO commercial"),
     "MILITARY":         (15.0, True,  200.0, "General Military designation"),
     "AEHF":            (20.0, True,  300.0, "Nuclear C2, highest hardening"),
@@ -247,6 +245,7 @@ class HANDSimulationAdvanced:
             effects = classify_prompt_effects(fluence_xray, fluence_neutron, dose_gamma)
             
             results.append({
+                'NORAD_ID': sat.model.satnum,
                 'Name': sat.name,
                 'Distance_km': distance_km,  # <-- 2. SAVE IT TO THE DATAFRAME
                 'XRay_Jm2': fluence_xray,
@@ -278,6 +277,7 @@ class HANDSimulationAdvanced:
             avg_dose_krad = np.mean(doses_krad)
             
             results.append({
+                'NORAD_ID': sat.model.satnum,
                 'Name': sat.name,
                 'Corrected_Argus_krad': avg_dose_krad,
                 'Inclination_deg': np.degrees(sat.model.inclo), # <-- ADD THIS
@@ -326,7 +326,7 @@ def plot_xray_fluence_vs_distance_empirical(df, simulated_yield_kt=1400, output_
     ax.axvspan(160, 2000, alpha=0.07, color="#3498db", label="LEO band")
     ax.set_xlabel("Distance from Burst Point [km]", fontsize=12)
     ax.set_ylabel("Prompt X-Ray Fluence [J m⁻²]", fontsize=12)
-    ax.set_title(f"VIZ 1: X-Ray Fluence vs. Distance ({simulated_yield_kt} kt Simulation)", fontsize=12)
+    ax.set_title(f"X-Ray Fluence vs. Distance ({simulated_yield_kt} kt Simulation)", fontsize=12)
     ax.legend(fontsize=8, ncol=2)
     ax.set_xlim(0, 50000)
     fig.tight_layout()
@@ -361,7 +361,7 @@ def plot_prompt_damage_radius_vs_yield_empirical(df, simulated_yield_kt=1400, ou
 
     ax.set_xlabel("Total Weapon Yield [kt]", fontsize=12)
     ax.set_ylabel("Approximate Threshold Damage Distance [km]", fontsize=12)
-    ax.set_title("VIZ 2: Prompt Damage Radius vs. Weapon Yield", fontsize=12)
+    ax.set_title("Prompt Damage Radius vs. Weapon Yield", fontsize=12)
     ax.legend(fontsize=8, ncol=2)
     ax.set_xlim(1, 1e4); ax.set_ylim(10, 1e4)
     fig.tight_layout()
@@ -377,7 +377,7 @@ def plot_argus_dose_vs_time_empirical(df, yield_kt=1400, burst_alt_km=400, sim_d
     
     # 1. THE FIX: Define a clean, representative list of constellations to plot
     # Make sure these strings exactly match your keys in CONSTELLATION_CATALOG
-    representatives = ["STARLINK", "ISS", "GPS", "GALILEO", "INTELSAT"]
+    representatives = ["STARLINK (LEO)","GPS (MEO)", "INTELSAT (GEO)"]
     
     if df is not None and not df.empty:
         for const in representatives:
@@ -402,7 +402,7 @@ def plot_argus_dose_vs_time_empirical(df, yield_kt=1400, burst_alt_km=400, sim_d
     
     ax.set_xlabel("Days After Detonation", fontsize=12)
     ax.set_ylabel("Cumulative TID [krad(Si)]", fontsize=12)
-    ax.set_title("VIZ 3: Argus Effect Cumulative TID over Time\n(Representative Orbits)", fontsize=12)
+    ax.set_title("Argus Effect Cumulative TID over Time\n(Representative Orbits)", fontsize=12)
     
     # 2. THE FIX: Move the legend outside the plot frame so it doesn't block the data
     ax.legend(fontsize=9, bbox_to_anchor=(1.02, 1), loc='upper left')
@@ -431,7 +431,7 @@ def plot_inclination_empirical_scatter(df, output_dir="results"):
     ax.set_yscale("log")
     ax.set_xlabel("Orbital Inclination [Degrees]", fontsize=12)
     ax.set_ylabel("Corrected 30-Day Argus TID [krad(Si)]", fontsize=12)
-    ax.set_title("VIZ 6: Radiation Exposure Profile by Orbital Inclination\n(Empirical Simulation Data)", fontsize=12)
+    ax.set_title("Radiation Exposure Profile by Orbital Inclination\n", fontsize=12)
     ax.legend(fontsize=9, ncol=2)
     ax.set_xlim(0, 100)
     
@@ -487,7 +487,6 @@ def plot_multi_effect_scatter(df, output_dir="results"):
     ax.set_xlabel("Prompt X-Ray Fluence [J m⁻²]", fontsize=12)
     ax.set_ylabel("Corrected 30-Day Argus TID [krad(Si)]", fontsize=12)
     ax.set_title("Satellite Survivability — Prompt vs. Delayed Radiation\n"
-                 "(Multi-effect status; corrected Argus bi-exponential decay model;\n"
                  "RAND RR-A3028-3 thresholds from Conrad et al. 2010)",
                  fontsize=12)
     # Deduplicated legend
@@ -535,7 +534,9 @@ if __name__ == "__main__":
             df_prompt = sim.calculate_prompt_effects()
             df_delayed = sim.calculate_delayed_argus_effect(days=30, shielding_al_mm=shielding_mm)
             
-            df_merged = pd.merge(df_prompt, df_delayed, on='Name')
+            # MERGE ON NORAD ID TO PREVENT CARTESIAN EXPLOSION
+            df_merged = pd.merge(df_prompt, df_delayed, on=['NORAD_ID', 'Name'])
+            
             df_merged['Constellation'] = const_key
             all_results.append(df_merged)
             
@@ -544,7 +545,7 @@ if __name__ == "__main__":
 
     if all_results:
         final_dataset = pd.concat(all_results, ignore_index=True)
-        final_dataset.to_csv("results/hand_simulation_final.csv", index=False)
+        final_dataset.to_csv(f"{OUT}/hand_simulation_final.csv", index=False)
         
         print("[+] Generating Visualizations...")
         plot_xray_fluence_vs_distance_empirical(final_dataset, output_dir=OUT)
