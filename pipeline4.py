@@ -71,23 +71,12 @@ CONSTELLATION_SHIELDING = {
 # =============================================================================
 # PART B: PHYSICS HELPERS (Argus Decay Model & Prompt Effects)
 # =============================================================================
-
+    
 def ae8_max_flux_simple(l_shell):
-    if np.ndim(l_shell) == 0:
-        l_shell = float(l_shell)
-        if l_shell < 1.05 or l_shell > 8.5:
-            return 1e2
-        inner = 1e9 * np.exp(-((l_shell - 1.5)**2) / (2 * 0.3**2))
-        outer = 5e7 * np.exp(-((l_shell - 4.5)**2) / (2 * 0.8**2))
-        return max(inner + outer, 1e2)
-    else:
-        l_shell = np.asarray(l_shell, dtype=float)
-        inner = 1e9 * np.exp(-((l_shell - 1.5)**2) / (2 * 0.3**2))
-        outer = 5e7 * np.exp(-((l_shell - 4.5)**2) / (2 * 0.8**2))
-        result = inner + outer
-        result[l_shell < 1.05] = 1e2
-        result[l_shell > 8.5]  = 1e2
-        return result
+    l = np.atleast_1d(np.asarray(l_shell, dtype=float))
+    r = 1e9*np.exp(-((l-1.5)**2)/(2*0.3**2)) + 5e7*np.exp(-((l-4.5)**2)/(2*0.8**2))
+    r[l<1.05]=1e2; r[l>8.5]=1e2
+    return float(r[0]) if r.size==1 else r
 
 def hand_enhancement_factor(l_shell, burst_l, yield_kt, time_days):
     starfish_kt = 1400.0
@@ -100,14 +89,10 @@ def hand_enhancement_factor(l_shell, burst_l, yield_kt, time_days):
 
     return 1.0 + peak_enh * spatial * temporal
 
-def shieldose2_factor(shielding_mm_al):
-    RHO_AL = 2.70
-    d = RHO_AL * shielding_mm_al / 10.0
-    D0, lam, d_bup, beta = 8.5e-4, 0.90, 0.05, 2.0
-    if d < d_bup:
-        return D0 * np.exp(-d / lam)
-    else:
-        return D0 * (1.0 + d / lam) ** (-beta)
+    
+def shieldose2_factor(mm):
+    d=2.70*mm/10; D0,lam,dbup,b=8.5e-4,0.90,0.05,2.0
+    return D0*np.exp(-d/lam) if d<dbup else D0*(1+d/lam)**(-b)
 
 def corrected_argus_dose(l_shell, burst_l, yield_kt, shielding_mm_al, days):
     phi_base = ae8_max_flux_simple(l_shell)
@@ -126,6 +111,17 @@ def corrected_argus_dose(l_shell, burst_l, yield_kt, shielding_mm_al, days):
 
     dose_rad  = dose_base + np.maximum(dose_enh, 0.0)
     return dose_rad, dose_rad / 1000.0 
+
+def corrected_argus_dose_krad(l_shell, burst_l, yield_kt, shield_mm, days):
+    phi  = ae8_max_flux_simple(l_shell)
+    enh  = 100.0*(yield_kt/1400.0)**0.7
+    sig  = 0.25+0.35*np.log10(max(yield_kt/10,1)+1)
+    spat = np.exp(-((np.asarray(l_shell)-burst_l)**2)/(2*sig**2))
+    alp  = min(0.1+0.15*burst_l, 0.5)
+    cf   = shieldose2_factor(shield_mm)
+    D    = np.asarray(phi)*cf*days + enh*np.asarray(phi)*spat*cf*(
+           alp*40*(1-np.exp(-days/40))+(1-alp)*500*(1-np.exp(-days/500)))
+    return float(np.mean(np.maximum(D,0)))/1000
 
 def classify_prompt_effects(xray_jm2, neutron_nm2, gamma_rads):
     effects = []
@@ -360,7 +356,7 @@ def plot_prompt_damage_radius_vs_yield_empirical(df, simulated_yield_kt=1400, ou
             ax.scatter([simulated_yield_kt], [min_dist], s=80, marker='*', zorder=5, label=f"Closest {const} in Sim")
 
     ax.set_xlabel("Total Weapon Yield [kt]", fontsize=12)
-    ax.set_ylabel("Approximate Threshold Damage Distance [km]", fontsize=12)
+    ax.set_ylabel("Threshold Radius for Damage [km]", fontsize=12)
     ax.set_title("Prompt Damage Radius vs. Weapon Yield", fontsize=12)
     ax.legend(fontsize=8, ncol=2)
     ax.set_xlim(1, 1e4); ax.set_ylim(10, 1e4)
@@ -411,6 +407,130 @@ def plot_argus_dose_vs_time_empirical(df, yield_kt=1400, burst_alt_km=400, sim_d
     fig.tight_layout()
     fig.savefig(os.path.join(output_dir, "VIZ3_argus_dose_time_empirical.png"), dpi=150)
     plt.close(fig)
+
+def plot_argus_dose_vs_time_FIXED(df, yield_kt=1400, burst_alt_km=400,
+                                   sim_days=30, output_dir="results"):
+    
+    # ── Altitude bounds for constellation validity filtering ──────
+    # Satellites whose mean altitude falls outside these ranges are
+    # misclassified, in transfer orbits, or have corrupted SGP4 output.
+    ALT_BOUNDS = {
+        "STARLINK (LEO)": (300, 700),
+        "GPS (MEO)":      (19000, 21500),
+        "INTELSAT (GEO)": (34000, 37000),
+    }
+    SHIELDING = {"STARLINK (LEO)": 2.0, "GPS (MEO)": 10.0, "INTELSAT (GEO)": 8.0}
+    INCLINATIONS = {"STARLINK (LEO)": 53.0, "GPS (MEO)": 55.0, "INTELSAT (GEO)": 0.1}
+    COLORS = {"STARLINK (LEO)": "#3498db", "GPS (MEO)": "#e67e22", "INTELSAT (GEO)": "#2ecc71"}
+
+    os.makedirs(output_dir, exist_ok=True)
+    burst_L = (RE_KM + burst_alt_km) / RE_KM
+    t_days  = np.linspace(0, 100, 300)
+ 
+    fig, ax = plt.subplots(figsize=(13, 8))
+ 
+    for const in ["STARLINK (LEO)", "GPS (MEO)", "INTELSAT (GEO)"]:
+        col   = COLORS[const]
+        shield = SHIELDING[const]
+        incl  = INCLINATIONS[const]
+        lo, hi = ALT_BOUNDS[const]
+ 
+        # ── BUG 1 + BUG 3 FIX: filter by altitude bounds ─────
+        # Removes: (a) negative/zero alt from decayed TLEs
+        #          (b) misclassified objects (e.g. INTELSAT 2-F1 at MEO)
+        #          (c) Starlink in transfer orbits > 700 km
+        const_data = df[(df['Constellation'] == const) &
+                        (df['Mean_Alt_km'] >= lo) &
+                        (df['Mean_Alt_km'] <= hi)].copy()
+ 
+        if const_data.empty:
+            print(f"[WARN] No valid data for {const} after filtering")
+            continue
+ 
+        n_removed = len(df[df['Constellation']==const]) - len(const_data)
+        print(f"{const}: {len(const_data)} satellites "
+              f"(removed {n_removed} out-of-range)")
+ 
+        # ── BUG 2 FIX: use MEDIAN altitude to compute proxy_L ─
+        # Mean is skewed by the remaining outliers even after filtering.
+        # Median is robust and correctly represents the constellation.
+        median_alt   = const_data['Mean_Alt_km'].median()
+        proxy_L_eq   = (RE_KM + median_alt) / RE_KM
+ 
+        # Orbit-mean L: inclined orbits sweep to higher mag latitudes
+        # L(lat) = r/RE / cos²(lat_mag) — sample over ±incl
+        incl_rad = np.radians(incl)
+        lats_sampled = np.linspace(-incl_rad, incl_rad, 360)
+        L_orbit_dist = np.clip(proxy_L_eq / (np.cos(lats_sampled)**2 + 1e-9),
+                               proxy_L_eq, proxy_L_eq * 3.0)
+        proxy_L_orbit = float(np.mean(L_orbit_dist))
+ 
+        avg_sim_dose = const_data['Corrected_Argus_krad'].median()
+ 
+        print(f"  Median alt:        {median_alt:.0f} km")
+        print(f"  Equatorial L:      {proxy_L_eq:.4f}")
+        print(f"  Orbit-mean L:      {proxy_L_orbit:.4f}")
+        print(f"  Median sim dose:   {avg_sim_dose:.2f} krad")
+ 
+        # Theory at equatorial L (solid)
+        doses_eq  = [corrected_argus_dose_krad(proxy_L_eq, burst_L,
+                                                yield_kt, shield, t)
+                     for t in t_days]
+        line, = ax.semilogy(t_days, doses_eq, color=col, lw=2.5, ls="-",
+                             label=f"Theory {const}  (eq. L={proxy_L_eq:.2f})")
+ 
+        # Theory at orbit-mean L (dashed) — brackets the simulation
+        doses_orb = [corrected_argus_dose_krad(proxy_L_orbit, burst_L,
+                                                yield_kt, shield, t)
+                     for t in t_days]
+        ax.semilogy(t_days, doses_orb, color=col, lw=1.8, ls="--",
+                    label=f"Theory {const}  (orbit L={proxy_L_orbit:.2f}, "
+                          f"i={incl:.0f}°)")
+ 
+        # Simulated median marker
+        ax.scatter([sim_days], [avg_sim_dose],
+                   color=col, s=160, marker='X', zorder=6,
+                   edgecolors='white', linewidths=1,
+                   label=f"Simulated {const}  "
+                         f"(Day {sim_days}, median, N={len(const_data)})")
+ 
+    ax.axvline(sim_days, color="red", ls="--", alpha=0.4, lw=1.5,
+               label="Simulation end (Day 30)")
+    
+    ax.axhline(5, color="black", ls='--', label="5 krad Dose")
+    ax.axhline(10, color="purple", ls='--', label="10 krad Dose")
+ 
+    # Physics annotation
+    # ax.annotate(
+    #     "Simulated X should fall between\n"
+    #     "solid (equatorial L) and dashed\n"
+    #     "(orbit-mean L) curves.\n"
+    #     "Residual gap = geomagnetic dipole\n"
+    #     "tilt not captured by simple\n"
+    #     "latitude sweep model.",
+    #     xy=(31, 50), xytext=(48, 20),
+    #     fontsize=8, color="#444",
+    #     arrowprops=dict(arrowstyle="->", color="#888", lw=0.8),
+    #     bbox=dict(boxstyle="round,pad=0.4", fc="white", alpha=0.85, ec="#ccc")
+    # )
+ 
+    ax.set_xlabel("Days After Detonation", fontsize=12)
+    ax.set_ylabel("Cumulative TID [krad(Si)]", fontsize=12)
+    ax.set_title(
+        "Argus Effect: Cumulative TID over Time  (Corrected)\n"
+        "Solid = theory at equatorial L  |  "
+        "Dashed = theory at orbit-mean L (inclination-adjusted)  |  "
+        "X = simulation median",
+        fontsize=10
+    )
+    ax.legend(fontsize=8, bbox_to_anchor=(1.02, 1), loc='upper left')
+    ax.set_xlim(0, 100)
+    fig.tight_layout()
+ 
+    path = os.path.join(output_dir, "VIZ3_argus_dose_time_FIXED.png")
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"\n[Plot] {path}")
 
 def plot_inclination_empirical_scatter(df, output_dir="results"):
     import os; os.makedirs(output_dir, exist_ok=True)
@@ -499,10 +619,75 @@ def plot_multi_effect_scatter(df, output_dir="results"):
     fig.savefig(path, dpi=150, bbox_inches="tight"); plt.close(fig)
     print(f"[Plot] {path}")
 
+def plot_altitude_governed_survivability(df, output_dir="results"):
+    """
+    Revised VIZ5: Altitude-Governed Survivability Scatter.
+    Color is mapped to Mean_Alt_km to differentiate orbital regimes.
+    Marker shapes differentiate between Military (Hardened) and Commercial assets.
+    """
+    import os
+    import matplotlib.cm as cm
+    os.makedirs(output_dir, exist_ok=True)
 
+    if df is None or len(df) == 0:
+        print("[VIZ5-Rev] No data provided, skipping.")
+        return
 
-# (You can leave VIZ 4 and VIZ 7 as they were, or omit them, as they are pure theoretical policy curves 
-# representing variables completely outside the bounds of a single satellite simulation run).
+    df = df.copy()
+    
+    # 1. Identify Hardened vs Unhardened for marker shapes
+    hardened_keywords = ['GPS', 'NAVSTAR', 'GLONASS', 'BEIDOU', 'MILITARY', 'USA-', 'AEHF']
+    df['Is_Hardened'] = df['Constellation'].apply(
+        lambda x: any(h in str(x).upper() for h in hardened_keywords)
+    )
+
+    fig, ax = plt.subplots(figsize=(12, 8))
+
+    # 2. Scatter plot with color = Altitude
+    # We plot unhardened and hardened separately to use different markers
+    # but they share the same color scale (cmap)
+    sc_comm = ax.scatter(
+        df[~df['Is_Hardened']]['XRay_Jm2'], 
+        df[~df['Is_Hardened']]['Corrected_Argus_krad'],
+        c=df[~df['Is_Hardened']]['Mean_Alt_km'],
+        cmap='viridis', marker='o', s=25, alpha=0.6, edgecolors='none', label='Commercial (COTS)'
+    )
+    
+    sc_mil = ax.scatter(
+        df[df['Is_Hardened']]['XRay_Jm2'], 
+        df[df['Is_Hardened']]['Corrected_Argus_krad'],
+        c=df[df['Is_Hardened']]['Mean_Alt_km'],
+        cmap='viridis', marker='D', s=35, alpha=0.9, edgecolors='white', linewidth=0.5, label='Military (Hardened)'
+    )
+
+    # 3. Add Colorbar for Altitude
+    cbar = plt.colorbar(sc_comm, ax=ax)
+    cbar.set_label('Mean Orbital Altitude [km]', fontsize=10)
+
+    # 4. Standard RAND/Conrad Thresholds (Keep as reference lines)
+    ax.axvline(400,  color="#c0392b", ls="--", lw=1.5, label="X-ray Thermal Limit")
+    ax.axhline(5.0,  color="#8e44ad", ls=":",  lw=1.2, label="COTS TID Limit (5krad)")
+    ax.axhline(100,  color="#2c3e50", ls="-.",  lw=1.2, label="Mil-Spec TID Limit (100krad)")
+
+    # 5. Aesthetics
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlim(left=1e-3, right=1e4) 
+    ax.set_ylim(bottom=1e-2, top=1e7)
+    
+    ax.set_xlabel("Prompt X-Ray Fluence [J m⁻²]", fontsize=12)
+    ax.set_ylabel("Corrected 30-Day Argus TID [krad(Si)]", fontsize=12)
+    ax.set_title("The Altitude-Vulnerability Chasm\nPrompt vs. Delayed Radiation Exposure", fontsize=14, pad=15)
+    
+    ax.grid(True, which="both", ls="-", alpha=0.1)
+    ax.legend(loc='lower left', fontsize=9)
+
+    fig.tight_layout()
+    path = os.path.join(output_dir, "VIZ5_altitude_survivability_scatter.png")
+    fig.savefig(path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[Plot] {path}")
+
 # =============================================================================
 # EXECUTION BLOCK
 # =============================================================================
@@ -550,9 +735,10 @@ if __name__ == "__main__":
         print("[+] Generating Visualizations...")
         plot_xray_fluence_vs_distance_empirical(final_dataset, output_dir=OUT)
         plot_prompt_damage_radius_vs_yield_empirical(final_dataset, output_dir=OUT)
-        plot_argus_dose_vs_time_empirical(final_dataset, output_dir=OUT)
+        plot_argus_dose_vs_time_FIXED(final_dataset, output_dir=OUT)
         plot_multi_effect_scatter(final_dataset, output_dir=OUT)
         plot_inclination_empirical_scatter(final_dataset, output_dir=OUT)
+        plot_altitude_governed_survivability(final_dataset, output_dir=OUT)
         
         print("[+] Execution Complete.")
     else:
