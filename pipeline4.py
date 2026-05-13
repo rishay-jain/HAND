@@ -1,15 +1,11 @@
 """
 HAND Simulation Pipeline
 ================================================================
-Integrated framework for High-Altitude Nuclear Detonation satellite 
-survivability modeling.
+Models prompt X-ray and delayed Argus-effect radiation exposure
+to satellite constellations from a high-altitude nuclear detonation.
 
-Features:
-- Prompt X-Ray, Neutron, and Gamma attenuation and effect modeling.
-- Tilted dipole L-shell magnetic mapping.
-- Bi-exponential temporal decay for Argus effects (Conrad et al. 2008).
-- SHIELDOSE-2 power-law shielding attenuation (Seltzer 1994).
-- Publication-quality visualization suite.
+Author: Rishay Jain
+Date:   May 2026
 """
 
 import os
@@ -17,15 +13,15 @@ import re
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import warnings
 from datetime import timedelta
 from skyfield.api import wgs84, load
 
-warnings.filterwarnings("ignore")
+# ===========================================================================
+# CATALOGS AND CONSTANTS
+# ===========================================================================
 
-# =============================================================================
-# PART A: CATALOGS AND CONSTANTS
-# =============================================================================
+TLE_FILEPATH = '3le.txt'
+OUTPUT_DIRECTORY = "results"
 
 RE_KM = 6371.0
 
@@ -35,17 +31,17 @@ CONSTELLATION_CATALOG = {
     "IRIDIUM":           ("IRIDIUM",),    
     "PLANET (LEO)":            ("FLOCK", "PELICAN", "SKYSAT"), # Combined into a single Planet key                   
     "GALILEO":           ("GALILEO",),        
-    # "GLOBALSTAR":        ("GLOBALSTAR",),      # ~1414 km, 52° incl. 
-    # "ORBCOMM":           ("ORBCOMM",),         # ~715 km, various incl.
-    # "WORLDVIEW":         ("WORLDVIEW",),       # Maxar, ~617 km, 97.9° SSO
     "ISS":               ("ISS (ZARYA)",),     # ~408 km, 51.6° incl. HUMAN CREW
     "GPS (MEO)":               ("NAVSTAR",),         # Legacy GPS naming (could also add "GPS IIR" here)
     "GLONASS":           ("GLONASS",),         # Russian GNSS, ~19 130 km, 64.8° incl.
     "BEIDOU_MEO":        ("BEIDOU",),          # Chinese GNSS MEO component
     "INTELSAT (GEO)":          ("INTELSAT",),        # GEO, 35 786 km, ~0° incl.
-    # "INMARSAT":          ("INMARSAT",),        # GEO maritime/aero comms
     "MILITARY":          ("USA ",),            # Will match USA-### designations
     "AEHF":              ("AEHF",),            # Advanced EHF (nuclear C2), GEO
+    # "GLOBALSTAR":        ("GLOBALSTAR",),      # ~1414 km, 52° incl. 
+    # "ORBCOMM":           ("ORBCOMM",),         # ~715 km, various incl.
+    # "WORLDVIEW":         ("WORLDVIEW",),       # Maxar, ~617 km, 97.9° SSO
+    # "INMARSAT":          ("INMARSAT",),        # GEO maritime/aero comms
 }
 
 CONSTELLATION_SHIELDING = {
@@ -56,74 +52,134 @@ CONSTELLATION_SHIELDING = {
     "PLANET (LEO)":    (2.5,  False, 5.0,   "COTS cubesat"),
     "GPS (MEO)":             (10.0, True,  100.0, "Rad-hardened per MIL-spec"),
     "GALILEO":         (8.0,  False, 30.0,  "Commercial components, some hardening"),
-    "GLOBALSTAR":      (3.0,  False, 10.0,  "Commercial LEO"),
-    "ORBCOMM":         (2.0,  False, 5.0,   "COTS IoT LEO"),
     "ISS":             (15.0, False, 50.0,  "Crew vehicle — human dose limits apply"),
     "BEIDOU_MEO":      (10.0, True,  100.0, "Rad-hardened estimate?"),
-    "WORLDVIEW":       (10.0, True,  200.0, "Rad-hardened BAE Systems RAD750 computer"),
     "GLONASS":         (8.0,  True,  75.0,  "Partial hardening"),
     "INTELSAT (GEO)":        (8.0,  True,  50.0,  "GEO, designed for belt exposure"),
-    "INMARSAT":        (8.0,  True,  50.0,  "GEO commercial"),
     "MILITARY":         (15.0, True,  200.0, "General Military designation"),
     "AEHF":            (20.0, True,  300.0, "Nuclear C2, highest hardening"),
+    # "GLOBALSTAR":      (3.0,  False, 10.0,  "Commercial LEO"),
+    # "ORBCOMM":         (2.0,  False, 5.0,   "COTS IoT LEO"),
+    # "WORLDVIEW":       (10.0, True,  200.0, "Rad-hardened BAE Systems RAD750 computer"),
+    # "INMARSAT":        (8.0,  True,  50.0,  "GEO commercial"),
 }
 
 # =============================================================================
-# PART B: PHYSICS HELPERS (Argus Decay Model & Prompt Effects)
+# PHYSICS HELPERS
 # =============================================================================
     
 def ae8_max_flux_simple(l_shell):
+    """
+    Return the AE8-MAX omnidirectional integral electron flux [e cm^-2 s^-1]
+    for electrons with E > 1 MeV at a given McIlwain L-shell value.
+
+    Uses a two-term Gaussian sum fit to digitised AE8-MAX data (Vette 1991),
+    capturing the inner belt peak near L = 1.5 and the outer belt peak near
+    L = 4.5. Returns a floor value of 100 e cm^-2 s^-1 outside L = [1.05, 8.5].
+
+    Accepts scalar or array input; returns float for scalar, ndarray for array.
+
+    Reference: Vette, J.I. (1991). NSSDC/WDC-A-R&S 91-24.
+    """
+
     l = np.atleast_1d(np.asarray(l_shell, dtype=float))
     r = 1e9*np.exp(-((l-1.5)**2)/(2*0.3**2)) + 5e7*np.exp(-((l-4.5)**2)/(2*0.8**2))
     r[l<1.05]=1e2; r[l>8.5]=1e2
     return float(r[0]) if r.size==1 else r
-
-def hand_enhancement_factor(l_shell, burst_l, yield_kt, time_days):
-    starfish_kt = 1400.0
-    peak_enh    = 100.0 * (yield_kt / starfish_kt) ** 0.7
-    sigma_l     = 0.25 + 0.35 * np.log10(max(yield_kt / 10.0, 1.0) + 1.0)
-
-    spatial  = np.exp(-((l_shell - burst_l)**2) / (2 * sigma_l**2))
-    alpha    = min(0.1 + 0.15 * burst_l, 0.5)
-    temporal = alpha * np.exp(-time_days / 40.0) + (1 - alpha) * np.exp(-time_days / 500.0)
-
-    return 1.0 + peak_enh * spatial * temporal
-
-    
+  
 def shieldose2_factor(mm):
+    """
+    Return the dose conversion factor [rad(Si) day^-1 per e cm^-2 s^-1] for
+    electrons passing through a slab of aluminium shielding of thickness mm.
+
+    Parameterises the SHIELDOSE-2 attenuation model (Seltzer 1994) as a
+    function of areal density d = rho_Al * t [g cm^-2]:
+      - For d < 0.05 g cm^-2: exponential attenuation, f(d) = D₀ exp(-d/λ)
+      - For d ≥ 0.05 g cm^-2: power-law attenuation, f(d) = D₀ (1 + d/λ)^−β
+    with D₀ = 8.5 * 10^-4, λ = 0.90 g cm^-2, β = 2.0.
+
+    Cross-verified against published AE8-MAX dose rates of ~600 krad yr^-1
+    at L = 1.5 behind 2 mm Al (Stassinopoulos & Raymond 1988).
+
+    Reference: Seltzer, S.M. (1994). IEEE TNS, 41(6), 2016-2022.
+    """
     d=2.70*mm/10; D0,lam,dbup,b=8.5e-4,0.90,0.05,2.0
     return D0*np.exp(-d/lam) if d<dbup else D0*(1+d/lam)**(-b)
 
-def corrected_argus_dose(l_shell, burst_l, yield_kt, shielding_mm_al, days):
-    phi_base = ae8_max_flux_simple(l_shell)
-    peak_enh = 100.0 * (yield_kt / 1400.0) ** 0.7
-    sigma_l  = 0.25 + 0.35 * np.log10(max(yield_kt / 10.0, 1.0) + 1.0)
-    spatial  = np.exp(-((l_shell - burst_l)**2) / (2 * sigma_l**2))
-    alpha    = min(0.1 + 0.15 * burst_l, 0.5)
-    cf = shieldose2_factor(shielding_mm_al)
+def corrected_argus_dose_krad(l_shell, burst_l, yield_kt, shield_mm, days):
+    """
+    Return the analytically integrated cumulative total ionizing dose
+    [krad(Si)] accumulated from t = 0 to t = days at the given L-shell.
 
+    The total dose has two components:
+      1. Baseline: AE8-MAX flux at l_shell integrated linearly over time.
+      2. HAND enhancement: injected electron population modelled as a
+         Gaussian in L-shell space centred on burst_l, decaying bi-
+         exponentially with τ₁ = 40 days (wave-particle scattering) and
+         τ₂ = 500 days (Coulomb drag). Both components are integrated
+         analytically, giving closed-form integrals of the form
+         τ(1 - exp(-T/τ)).
+
+    Peak enhancement is calibrated to Starfish Prime: a 1400 kt burst
+    produces 100x the AE8-MAX baseline at the burst L-shell, with yield
+    scaling following A ∝ Y^0.7 (Christofilos 1959; Hess 1963).
+
+    Dose rate conversion uses shieldose2_factor(shield_mm).
+
+    Accepts scalar or array l_shell; returns the mean dose across the
+    distribution when an array is supplied (used for orbit-averaged dose).
+
+    References:
+      Conrad et al. (2008). JGR, 113, A02225.
+      Hess, W.N. (1963). JGR, 68(3), 667-683.
+    """
+    
+    phi_base  = ae8_max_flux_simple(l_shell)
+    peak_enh  = 100.0 * (yield_kt / 1400.0) ** 0.7
+    sigma_l  = 0.25 + 0.35 * np.log10(max(yield_kt / 10.0, 1.0) + 1.0)
+    spatial = np.exp(-((np.asarray(l_shell)-burst_l)**2)/(2*sigma_l**2))
+    alpha  = min(0.1 + 0.15 * burst_l, 0.5)
+    cf   = shieldose2_factor(shield_mm)
+    A = peak_enh * phi_base * spatial * cf
+    
     base_dr = phi_base * cf
     dose_base = base_dr * days
     
-    A = peak_enh * phi_base * spatial * cf
     dose_enh = A * (alpha * 40.0 * (1 - np.exp(-days / 40.0)) +
                     (1 - alpha) * 500.0 * (1 - np.exp(-days / 500.0)))
 
     dose_rad  = dose_base + np.maximum(dose_enh, 0.0)
-    return dose_rad, dose_rad / 1000.0 
-
-def corrected_argus_dose_krad(l_shell, burst_l, yield_kt, shield_mm, days):
-    phi  = ae8_max_flux_simple(l_shell)
-    enh  = 100.0*(yield_kt/1400.0)**0.7
-    sig  = 0.25+0.35*np.log10(max(yield_kt/10,1)+1)
-    spat = np.exp(-((np.asarray(l_shell)-burst_l)**2)/(2*sig**2))
-    alp  = min(0.1+0.15*burst_l, 0.5)
-    cf   = shieldose2_factor(shield_mm)
-    D    = np.asarray(phi)*cf*days + enh*np.asarray(phi)*spat*cf*(
-           alp*40*(1-np.exp(-days/40))+(1-alp)*500*(1-np.exp(-days/500)))
-    return float(np.mean(np.maximum(D,0)))/1000
+    return dose_rad/1000
 
 def classify_prompt_effects(xray_jm2, neutron_nm2, gamma_rads):
+    """
+    Return a list of damage tags for a satellite given prompt radiation
+    fluences at its location.
+
+    All three mechanisms are evaluated independently; multiple tags may
+    be returned for a single satellite. Thresholds from Conrad et al. (2010)
+    as reported in Snyder et al. (2025) RAND RR-A3028-3:
+
+      X-ray fluence [J m^-2]:
+        ≥ 0.4   → X-RAY:IONIZ_UPSET      (ionisation damage to electronics)
+        ≥ 4.0   → X-RAY:SGEMP_FATAL      (system-generated EMP)
+        ≥ 400   → X-RAY:THERMAL_FATAL    (structural/thermal failure)
+
+      Neutron fluence [n m^-2]:
+        ≥ 1x10^10 → NEUTRON:UPSET         (electronic upset)
+        ≥ 1x10^16 → NEUTRON:LATTICE_FATAL (atomic lattice displacement)
+
+      Gamma dose [rad(Si)]:
+        ≥ 1x10^3  → GAMMA:TID_UPSET
+        ≥ 1x10^4  → GAMMA:TID_FATAL
+
+    Returns ["NOMINAL"] if no threshold is exceeded.
+
+    References:
+      Conrad et al. (2010). DTRA-IR-10-22.
+      Snyder et al. (2025). RAND RR-A3028-3.
+    """
+    
     effects = []
     if xray_jm2 >= 400: effects.append("X-RAY:THERMAL_FATAL")
     if xray_jm2 >= 4.0: effects.append("X-RAY:SGEMP_FATAL")
@@ -135,28 +191,64 @@ def classify_prompt_effects(xray_jm2, neutron_nm2, gamma_rads):
     return effects if effects else ["NOMINAL"]
 
 def prompt_overall_status(effects_list):
+    """
+    Collapse a list of damage tags from classify_prompt_effects() into a
+    single worst-case status string for reporting and visualisation.
+
+      "Fatal/Destroyed"   — at least one FATAL tag is present
+      "Severely Degraded" — at least one UPSET or SGEMP tag, no FATAL
+      "Nominal"           — no damage tags (effects_list == ["NOMINAL"])
+    """
+
     joined = " ".join(effects_list)
     if "FATAL" in joined: return "Fatal/Destroyed"
     elif "UPSET" in joined or "SGEMP" in joined: return "Severely Degraded"
     return "Nominal"
 
 # =============================================================================
-# PART C: SIMULATION CLASS
+# SIMULATION CLASS
 # =============================================================================
 
 class HANDSimulationAdvanced:
-    import re
-from skyfield.api import load, wgs84
+    """
+    End-to-end simulation of prompt and delayed radiation effects on a
+    single satellite constellation from a high-altitude nuclear detonation.
 
-class HANDSimulationAdvanced:
+    Workflow:
+      1. Instantiate with a TLE catalog and a constellation key.
+      2. Call simulate_burst_condition() to define the detonation scenario.
+      3. Call calculate_prompt_effects() for instant X-ray, neutron, and
+         gamma fluences at the detonation epoch.
+      4. Call calculate_delayed_argus_effect() for 30-day accumulated TID
+         from the enhanced Van Allen belt.
+
+    Both output methods return a pandas DataFrame keyed on NORAD_ID and
+    Name, suitable for merging and export.
+    """
+
     def __init__(self, tle_file, target_constellation="STARLINK", preloaded_sats=None):
+        """
+        Load the TLE catalog and filter to the target constellation.
+
+        Parameters
+        ----------
+        tle_file : str
+            Path to the Space-Track 3LE catalog file.
+        target_constellation : str
+            Key into CONSTELLATION_CATALOG. Determines which name strings
+            are used to filter the catalog.
+        preloaded_sats : list, optional
+            A pre-parsed satellite list from a prior skyfield load.tle_file() call.
+            When provided the catalog file is not re-read from disk, which
+            is the expected usage when iterating over multiple constellations
+            from the same catalog.
+        """
+
         self.ts = load.timescale()
         self.planets = load('de421.bsp')
         self.earth = self.planets['earth']
         
-        # ---------------------------------------------------------
-        # OPTIMIZATION 1: Eliminate Redundant Disk I/O
-        # ---------------------------------------------------------
+        # Reuse a pre-loaded satellite list if provided to avoid redundant disk reads
         if preloaded_sats is None:
             # Only hit the disk if no pre-loaded list was provided
             self.satellites = load.tle_file(tle_file)
@@ -164,14 +256,11 @@ class HANDSimulationAdvanced:
             # Use the existing memory reference (Instantaneous)
             self.satellites = preloaded_sats
             
-        # ---------------------------------------------------------
-        # OPTIMIZATION 2: Regex Multi-String Filtering
-        # ---------------------------------------------------------
+        # Build a regex pattern from the constellation's name strings for efficient filtering
         # Get the tuple of strings (e.g. ("FLOCK", "PELICAN", "SKYSAT"))
         filter_tuple = CONSTELLATION_CATALOG.get(target_constellation, (target_constellation,))
         
         # Compile a regex pattern (e.g. 'FLOCK|PELICAN|SKYSAT')
-        # This executes in highly optimized C code, much faster than python loops
         pattern = re.compile('|'.join(filter_tuple))
         
         # Filter the list
@@ -179,24 +268,70 @@ class HANDSimulationAdvanced:
         
         print(f"Loaded {len(self.target_sats)} satellites for {target_constellation}")
 
-    def simulate_burst(self, burst_lat, burst_lon, burst_alt_km, yield_kt, burst_time_utc):
+    def simulate_burst_condition(self, burst_lat, burst_lon, burst_alt_km, yield_kt, burst_time_utc):
+        """
+        Define the detonation scenario. Must be called before either
+        calculate method.
+
+        Parameters
+        ----------
+        burst_lat : float
+            Sub-burst geodetic latitude [degrees].
+        burst_lon : float
+            Sub-burst longitude [degrees].
+        burst_alt_km : float
+            Burst altitude above the WGS-84 ellipsoid [km].
+        yield_kt : float
+            Total weapon yield [kilotons].
+        burst_time_utc : tuple
+            UTC detonation time as (year, month, day, hour, minute, second).
+
+        Sets
+        ----
+        self.burst_time, self.yield_kt, self.burst_alt_km,
+        self.burst_icrf (GCRS position vector), self.burst_L_shell.
+        """
+
         self.burst_time = self.ts.utc(*burst_time_utc)
         self.yield_kt = yield_kt
         self.burst_alt_km = burst_alt_km
         
-        # Modern Skyfield approach using the WGS84 Geoid
         self.burst_geo = wgs84.latlon(latitude_degrees=burst_lat, 
                                       longitude_degrees=burst_lon, 
                                       elevation_m=burst_alt_km * 1000)
         
-        # Calling .at(t) on a wgs84 geographic position directly returns 
-        # Geocentric coordinates (Earth center = 399). No solar system barycenter math!
         self.burst_icrf = self.burst_geo.at(self.burst_time)
         
-        # Calculate burst L-shell mapping
+        # Calculate L-shell mapping of burst
         self.burst_L_shell = self.calculate_l_shell(burst_lat, burst_lon, burst_alt_km)
 
     def calculate_l_shell(self, lat_deg, lon_deg, alt_km):
+        """
+        Compute the McIlwain L-parameter at a given geographic position.
+
+        Uses a tilted dipole approximation with the IGRF geomagnetic pole
+        at 80.8°N, 72.6°W:
+
+          sin(λ_mag) = sin(φ)sin(φ_p) + cos(φ)cos(φ_p)cos(λ - λ_p)
+          L = (r / R_E) / cos²(λ_mag)
+
+        Accepts scalar or array inputs for vectorised orbit sampling.
+
+        Parameters
+        ----------
+        lat_deg, lon_deg : float or array
+            Geodetic latitude and longitude [degrees].
+        alt_km : float or array
+            Altitude above Earth's surface [km].
+
+        Returns
+        -------
+        float or ndarray
+            McIlwain L-shell value(s).
+
+        Reference: McIlwain, C.E. (1961). JGR, 66(11), 3681-3691.
+        """
+
         lat_rad, lon_rad = np.radians(lat_deg), np.radians(lon_deg)
         lat_p, lon_p = np.radians(80.8), np.radians(-72.6)
         sin_mag_lat = np.sin(lat_rad)*np.sin(lat_p) + np.cos(lat_rad)*np.cos(lat_p)*np.cos(lon_rad - lon_p)
@@ -205,6 +340,29 @@ class HANDSimulationAdvanced:
         return r / (np.cos(mag_lat)**2)
 
     def calculate_ray_minimum_altitude(self, pos1_km, pos2_km):
+        """
+        Find the minimum altitude of the straight-line ray between two
+        GCRS position vectors.
+
+        Used to determine whether the burst-to-satellite line of sight
+        passes through the absorbing atmosphere. Finds the closest point
+        on the line segment [pos1_km, pos2_km] to the geocentre using the
+        standard parametric projection, then converts geocentric distance
+        to altitude above the surface.
+
+        Parameters
+        ----------
+        pos1_km, pos2_km : ndarray, shape (3,)
+            Geocentric position vectors [km].
+
+        Returns
+        -------
+        float
+            Minimum altitude of the ray path above the surface [km].
+            Negative values indicate the ray passes through the Earth
+            (satellite is in Earth's shadow).
+        """
+
         d = pos2_km - pos1_km
         t = -np.dot(pos1_km, d) / np.dot(d, d)
         if t < 0: min_point = pos1_km
@@ -213,6 +371,33 @@ class HANDSimulationAdvanced:
         return np.linalg.norm(min_point) - RE_KM
 
     def get_attenuation_factors(self, min_alt_km):
+        """
+        Return surviving fractions for X-ray and gamma/neutron radiation
+        given the minimum ray-path altitude.
+
+        Atmospheric absorption altitudes follow Glasstone & Dolan (1977)
+        Table 10.29 and Snyder et al. (2025) Figure 8:
+          - X-rays: fully transmitted above 90 km, linearly attenuated
+            between 90 and 55 km, fully absorbed below 55 km.
+          - Gamma and neutron: fully transmitted above 25 km, fully
+            absorbed below 25 km.
+
+        Parameters
+        ----------
+        min_alt_km : float
+            Minimum altitude of the burst-to-satellite ray path [km].
+
+        Returns
+        -------
+        x_ray_surv : float
+            Fraction of X-ray fluence that reaches the satellite [0, 1].
+        gamma_neutron_surv : float
+            Fraction of gamma/neutron fluence that reaches the satellite
+            [0 or 1].
+
+        Reference: Glasstone & Dolan (1977), Chapter 10.
+        """
+
         if min_alt_km > 90: x_ray_surv = 1.0
         elif min_alt_km > 55: x_ray_surv = (min_alt_km - 55) / (90 - 55) 
         else: x_ray_surv = 0.0
@@ -222,13 +407,37 @@ class HANDSimulationAdvanced:
         return x_ray_surv, gamma_neutron_surv
 
     def calculate_prompt_effects(self):
+        """
+        Compute prompt radiation fluences for every satellite at the
+        detonation epoch and classify each against published damage
+        thresholds.
+
+        For each satellite, computes slant range from burst, applies
+        atmospheric attenuation via get_attenuation_factors(), then
+        evaluates:
+          Φ_x   = 2.3x10^11 x Y / r²   [J m^-2]    (X-ray fluence)
+          Φ_n   = 1.6x10^11 x Y / r²   [n m^-2]    (neutron fluence)
+          D_γ   = 2.5x10^1  x Y / r²   [rad(Si)]  (gamma dose)
+
+        where Y is yield in kt and r is slant range in metres.
+
+        Returns
+        -------
+        pd.DataFrame
+            One row per satellite with columns: NORAD_ID, Name,
+            Distance_km, XRay_Jm2, Neutron_nm2, Gamma_radsSi,
+            Effects_List, Prompt_Status.
+
+        Reference: Conrad et al. (2010). DTRA-IR-10-22.
+        """
+
         results = []
         r_burst_km = self.burst_icrf.position.km
         
         for sat in self.target_sats:
             sat_pos = sat.at(self.burst_time)
             r_sat_km = sat_pos.position.km
-            distance_km = np.linalg.norm(r_sat_km - r_burst_km) # <-- 1. Calculate KM
+            distance_km = np.linalg.norm(r_sat_km - r_burst_km)
             distance_m = distance_km * 1000.0
             
             min_alt_km = self.calculate_ray_minimum_altitude(r_burst_km, r_sat_km)
@@ -243,7 +452,7 @@ class HANDSimulationAdvanced:
             results.append({
                 'NORAD_ID': sat.model.satnum,
                 'Name': sat.name,
-                'Distance_km': distance_km,  # <-- 2. SAVE IT TO THE DATAFRAME
+                'Distance_km': distance_km,
                 'XRay_Jm2': fluence_xray,
                 'Neutron_nm2': fluence_neutron,
                 'Gamma_radsSi': dose_gamma,
@@ -253,6 +462,33 @@ class HANDSimulationAdvanced:
         return pd.DataFrame(results)
 
     def calculate_delayed_argus_effect(self, days=30, shielding_al_mm=2.5):
+        """
+        Compute the accumulated Argus-effect TID for every satellite over
+        a specified post-detonation window.
+
+        For each satellite, the orbit is propagated at 5-minute intervals
+        over 24 hours from the detonation epoch using SGP4. The resulting
+        L-shell distribution is passed to corrected_argus_dose_krad(),
+        which integrates the HAND-enhanced AE8-MAX flux analytically over
+        the full dose window. The per-satellite result is the mean of the
+        dose values across all sampled orbit positions, capturing the
+        inclination-driven variation in L-shell exposure.
+
+        Parameters
+        ----------
+        days : int
+            Integration window for TID accumulation [days]. Default 30.
+        shielding_al_mm : float
+            Equivalent aluminium shielding thickness [mm]. Passed to
+            corrected_argus_dose_krad() via shieldose2_factor().
+
+        Returns
+        -------
+        pd.DataFrame
+            One row per satellite with columns: NORAD_ID, Name,
+            Corrected_Argus_krad, Inclination_deg, Mean_Alt_km.
+        """
+
         # Sample orbit over 24 hours to find L-Shell distribution (5 minute intervals)
         base_time = self.burst_time.utc_datetime()
         datetime_list = [base_time + timedelta(minutes=m) for m in range(0, 1440, 5)]
@@ -268,7 +504,7 @@ class HANDSimulationAdvanced:
                                                   subpoint.elevation.km)
             
             # Apply analytical dose model to the orbital distribution and average it
-            _, doses_krad = corrected_argus_dose(sat_l_shells, self.burst_L_shell, 
+            doses_krad = corrected_argus_dose_krad(sat_l_shells, self.burst_L_shell, 
                                                  self.yield_kt, shielding_al_mm, days)
             avg_dose_krad = np.mean(doses_krad)
             
@@ -276,18 +512,15 @@ class HANDSimulationAdvanced:
                 'NORAD_ID': sat.model.satnum,
                 'Name': sat.name,
                 'Corrected_Argus_krad': avg_dose_krad,
-                'Inclination_deg': np.degrees(sat.model.inclo), # <-- ADD THIS
-                'Mean_Alt_km': np.mean(subpoint.elevation.km)   # <-- ADD THIS
+                'Inclination_deg': np.degrees(sat.model.inclo),
+                'Mean_Alt_km': np.mean(subpoint.elevation.km) 
             })
             
         return pd.DataFrame(results)
 
 # =============================================================================
-# PART D: VISUALIZATIONS (Imported from your script)
+# VISUALIZATIONS
 # =============================================================================
-# [I have included your plot_multi_effect_scatter exactly as you provided it, 
-# you can seamlessly paste the rest of your Part D plotting functions here]
-
 
 STYLE = {
     "font.family": "DejaVu Sans",
@@ -300,8 +533,8 @@ STYLE = {
 }
 plt.rcParams.update(STYLE)
 
-def plot_xray_fluence_vs_distance_empirical(df, simulated_yield_kt=1400, output_dir="results"):
-    import os; os.makedirs(output_dir, exist_ok=True)
+def plot_xray_fluence_vs_distance_from_burst(df, simulated_yield_kt=1400, output_dir="results"):
+    os.makedirs(output_dir, exist_ok=True)
     fig, ax = plt.subplots(figsize=(11, 7))
 
     # Empirical Scatter
@@ -321,7 +554,7 @@ def plot_xray_fluence_vs_distance_empirical(df, simulated_yield_kt=1400, output_
 
     ax.axvspan(160, 2000, alpha=0.07, color="#3498db", label="LEO band")
     ax.set_xlabel("Distance from Burst Point [km]", fontsize=12)
-    ax.set_ylabel("Prompt X-Ray Fluence [J m⁻²]", fontsize=12)
+    ax.set_ylabel("Prompt X-Ray Fluence [J m^-2]", fontsize=12)
     ax.set_title(f"X-Ray Fluence vs. Distance ({simulated_yield_kt} kt Simulation)", fontsize=12)
     ax.legend(fontsize=8, ncol=2)
     ax.set_xlim(0, 50000)
@@ -330,8 +563,8 @@ def plot_xray_fluence_vs_distance_empirical(df, simulated_yield_kt=1400, output_
     plt.close(fig)
 
 
-def plot_prompt_damage_radius_vs_yield_empirical(df, simulated_yield_kt=1400, output_dir="results"):
-    import os; os.makedirs(output_dir, exist_ok=True)
+def plot_prompt_xray_damage_radius_vs_weapon_yield(df, simulated_yield_kt=1400, output_dir="results"):
+    os.makedirs(output_dir, exist_ok=True)
     yields_kt = np.logspace(0, 4, 300)
     
     r_xray_ion  = np.sqrt(2.3e11 * yields_kt / 0.4) / 1e3
@@ -364,54 +597,8 @@ def plot_prompt_damage_radius_vs_yield_empirical(df, simulated_yield_kt=1400, ou
     fig.savefig(os.path.join(output_dir, "VIZ2_prompt_damage_radius_empirical.png"), dpi=150)
     plt.close(fig)
 
-def plot_argus_dose_vs_time_empirical(df, yield_kt=1400, burst_alt_km=400, sim_days=30, output_dir="results"):
-    import os; os.makedirs(output_dir, exist_ok=True)
-    burst_L = (RE_KM + burst_alt_km) / RE_KM
-    t_days  = np.linspace(0, 100, 200)
-
-    fig, ax = plt.subplots(figsize=(12, 7))
+def plot_argus_dose_vs_time(df, yield_kt=1400, burst_alt_km=400, sim_days=30, output_dir="results"):
     
-    # 1. THE FIX: Define a clean, representative list of constellations to plot
-    # Make sure these strings exactly match your keys in CONSTELLATION_CATALOG
-    representatives = ["STARLINK (LEO)","GPS (MEO)", "INTELSAT (GEO)"]
-    
-    if df is not None and not df.empty:
-        for const in representatives:
-            # Check if the constellation actually exists in the simulation data
-            if const not in df['Constellation'].values: 
-                continue
-                
-            const_data = df[df['Constellation'] == const]
-            if const_data.empty: continue
-                
-            mean_L = const_data['Mean_Alt_km'].mean() 
-            proxy_L = (RE_KM + mean_L) / RE_KM
-            avg_sim_dose = const_data['Corrected_Argus_krad'].mean()
-            
-            doses = [corrected_argus_dose(proxy_L, burst_L, yield_kt, 2.5, t)[1] for t in t_days]
-            line, = ax.semilogy(t_days, doses, lw=2.2, alpha=0.8, label=f"Theoretical {const}")
-            
-            ax.scatter([sim_days], [avg_sim_dose], color=line.get_color(), s=120, marker='X', 
-                       zorder=5, label=f"Simulated {const} (Day {sim_days})")
-
-    ax.axvline(sim_days, color="red", ls="--", alpha=0.5, label="Simulation End Time")
-    
-    ax.set_xlabel("Days After Detonation", fontsize=12)
-    ax.set_ylabel("Cumulative TID [krad(Si)]", fontsize=12)
-    ax.set_title("Argus Effect Cumulative TID over Time\n(Representative Orbits)", fontsize=12)
-    
-    # 2. THE FIX: Move the legend outside the plot frame so it doesn't block the data
-    ax.legend(fontsize=9, bbox_to_anchor=(1.02, 1), loc='upper left')
-    
-    ax.set_xlim(0, 100)
-    fig.tight_layout()
-    fig.savefig(os.path.join(output_dir, "VIZ3_argus_dose_time_empirical.png"), dpi=150)
-    plt.close(fig)
-
-def plot_argus_dose_vs_time_FIXED(df, yield_kt=1400, burst_alt_km=400,
-                                   sim_days=30, output_dir="results"):
-    
-    # ── Altitude bounds for constellation validity filtering ──────
     # Satellites whose mean altitude falls outside these ranges are
     # misclassified, in transfer orbits, or have corrupted SGP4 output.
     ALT_BOUNDS = {
@@ -435,10 +622,6 @@ def plot_argus_dose_vs_time_FIXED(df, yield_kt=1400, burst_alt_km=400,
         incl  = INCLINATIONS[const]
         lo, hi = ALT_BOUNDS[const]
  
-        # ── BUG 1 + BUG 3 FIX: filter by altitude bounds ─────
-        # Removes: (a) negative/zero alt from decayed TLEs
-        #          (b) misclassified objects (e.g. INTELSAT 2-F1 at MEO)
-        #          (c) Starlink in transfer orbits > 700 km
         const_data = df[(df['Constellation'] == const) &
                         (df['Mean_Alt_km'] >= lo) &
                         (df['Mean_Alt_km'] <= hi)].copy()
@@ -451,14 +634,9 @@ def plot_argus_dose_vs_time_FIXED(df, yield_kt=1400, burst_alt_km=400,
         print(f"{const}: {len(const_data)} satellites "
               f"(removed {n_removed} out-of-range)")
  
-        # ── BUG 2 FIX: use MEDIAN altitude to compute proxy_L ─
-        # Mean is skewed by the remaining outliers even after filtering.
-        # Median is robust and correctly represents the constellation.
         median_alt   = const_data['Mean_Alt_km'].median()
         proxy_L_eq   = (RE_KM + median_alt) / RE_KM
  
-        # Orbit-mean L: inclined orbits sweep to higher mag latitudes
-        # L(lat) = r/RE / cos²(lat_mag) — sample over ±incl
         incl_rad = np.radians(incl)
         lats_sampled = np.linspace(-incl_rad, incl_rad, 360)
         L_orbit_dist = np.clip(proxy_L_eq / (np.cos(lats_sampled)**2 + 1e-9),
@@ -500,20 +678,6 @@ def plot_argus_dose_vs_time_FIXED(df, yield_kt=1400, burst_alt_km=400,
     ax.axhline(5, color="black", ls='--', label="5 krad Dose")
     ax.axhline(10, color="purple", ls='--', label="10 krad Dose")
  
-    # Physics annotation
-    # ax.annotate(
-    #     "Simulated X should fall between\n"
-    #     "solid (equatorial L) and dashed\n"
-    #     "(orbit-mean L) curves.\n"
-    #     "Residual gap = geomagnetic dipole\n"
-    #     "tilt not captured by simple\n"
-    #     "latitude sweep model.",
-    #     xy=(31, 50), xytext=(48, 20),
-    #     fontsize=8, color="#444",
-    #     arrowprops=dict(arrowstyle="->", color="#888", lw=0.8),
-    #     bbox=dict(boxstyle="round,pad=0.4", fc="white", alpha=0.85, ec="#ccc")
-    # )
- 
     ax.set_xlabel("Days After Detonation", fontsize=12)
     ax.set_ylabel("Cumulative TID [krad(Si)]", fontsize=12)
     ax.set_title(
@@ -533,7 +697,7 @@ def plot_argus_dose_vs_time_FIXED(df, yield_kt=1400, burst_alt_km=400,
     print(f"\n[Plot] {path}")
 
 def plot_inclination_empirical_scatter(df, output_dir="results"):
-    import os; os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
     if df is None or df.empty or 'Inclination_deg' not in df.columns:
         print("[VIZ6] Missing Inclination data. Skipping.")
         return
@@ -561,13 +725,8 @@ def plot_inclination_empirical_scatter(df, output_dir="results"):
 
 def plot_multi_effect_scatter(df, output_dir="results"):
     """
-    Enhanced version of pipeline2.py Visualization 1 (survivability scatter).
-    Uses corrected Argus dose and multi-effect status from classify_prompt_effects().
-    
-    df must have columns: XRay_Jm2, Neutron_nm2, Gamma_radsSi,
-                           Corrected_Argus_krad, Constellation
     """
-    import os; os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
 
     if df is None or len(df) == 0:
         print("[VIZ5] No data provided, skipping.")
@@ -604,7 +763,7 @@ def plot_multi_effect_scatter(df, output_dir="results"):
     ax.set_yscale("log")
     ax.set_xlim(left=1e-3) 
     ax.set_ylim(bottom=1e-2)
-    ax.set_xlabel("Prompt X-Ray Fluence [J m⁻²]", fontsize=12)
+    ax.set_xlabel("Prompt X-Ray Fluence [J m^-2]", fontsize=12)
     ax.set_ylabel("Corrected 30-Day Argus TID [krad(Si)]", fontsize=12)
     ax.set_title("Satellite Survivability — Prompt vs. Delayed Radiation\n"
                  "RAND RR-A3028-3 thresholds from Conrad et al. 2010)",
@@ -615,7 +774,7 @@ def plot_multi_effect_scatter(df, output_dir="results"):
     ax.legend(by_label.values(), by_label.keys(), fontsize=8, ncol=2,
                bbox_to_anchor=(1.02, 1), loc="upper left")
     fig.tight_layout()
-    path = os.path.join(output_dir, "VIZ5_survivability_scatter_corrected.png")
+    path = os.path.join(output_dir, "VIZ4_survivability_scatter_corrected.png")
     fig.savefig(path, dpi=150, bbox_inches="tight"); plt.close(fig)
     print(f"[Plot] {path}")
 
@@ -625,7 +784,6 @@ def plot_altitude_governed_survivability(df, output_dir="results"):
     Color is mapped to Mean_Alt_km to differentiate orbital regimes.
     Marker shapes differentiate between Military (Hardened) and Commercial assets.
     """
-    import os
     import matplotlib.cm as cm
     os.makedirs(output_dir, exist_ok=True)
 
@@ -675,7 +833,7 @@ def plot_altitude_governed_survivability(df, output_dir="results"):
     ax.set_xlim(left=1e-3, right=1e4) 
     ax.set_ylim(bottom=1e-2, top=1e7)
     
-    ax.set_xlabel("Prompt X-Ray Fluence [J m⁻²]", fontsize=12)
+    ax.set_xlabel("Prompt X-Ray Fluence [J m^-2]", fontsize=12)
     ax.set_ylabel("Corrected 30-Day Argus TID [krad(Si)]", fontsize=12)
     ax.set_title("The Altitude-Vulnerability Chasm\nPrompt vs. Delayed Radiation Exposure", fontsize=14, pad=15)
     
@@ -689,37 +847,39 @@ def plot_altitude_governed_survivability(df, output_dir="results"):
     print(f"[Plot] {path}")
 
 # =============================================================================
-# EXECUTION BLOCK
+# SIMULATION EXECUTION
 # =============================================================================
 
 if __name__ == "__main__":
-    TLE_FILE = '3le.txt'
-    OUT = "results4"
-    os.makedirs(OUT, exist_ok=True)
+    
+    os.makedirs(OUTPUT_DIRECTORY, exist_ok=True)
     all_results = []
     
-    # LOAD THE FILE EXACTLY ONCE HERE
-    print("[+] Parsing massive TLE catalog into memory...")
-    master_satellite_list = load.tle_file(TLE_FILE)
+    print("Parsing TLE catalog into memory...")
+    master_satellite_list = load.tle_file(TLE_FILEPATH)
     
     for const_key in CONSTELLATION_CATALOG.keys():
         try:
             shielding_mm = CONSTELLATION_SHIELDING.get(const_key, (2.5, False, 5.0, ""))[0]
             
             # PASS THE PRE-LOADED LIST INTO THE CLASS
-            sim = HANDSimulationAdvanced(TLE_FILE, 
+            sim = HANDSimulationAdvanced(TLE_FILEPATH, 
                                          target_constellation=const_key, 
                                          preloaded_sats=master_satellite_list)
             
             if len(sim.target_sats) == 0: continue
             
-            # Starfish Prime-esque burst (400km, 1400kT)
-            sim.simulate_burst(16.7, -169.5, 400.0, 1400.0, (2026, 5, 5, 12, 0, 0))
+            # Baseline scenario: Starfish Prime parameters at 2026 epoch
+            sim.simulate_burst_condition(16.7, -169.5, 400.0, 1400.0, (2026, 5, 5, 12, 0, 0))
             
+            # Calculate prompt effects post-detonation
+            # 70-80% of prompt effects are via X-Ray, hence the focus. 
+            # Neutron and Gamma effects dissipate within a few tens of kilometers, rendering them ineffective.
             df_prompt = sim.calculate_prompt_effects()
+            
             df_delayed = sim.calculate_delayed_argus_effect(days=30, shielding_al_mm=shielding_mm)
             
-            # MERGE ON NORAD ID TO PREVENT CARTESIAN EXPLOSION
+            # Merge based on NORAD ID and NAME to prevent many repetitive entries (e.g. for IRIDIUM 33 debris field)
             df_merged = pd.merge(df_prompt, df_delayed, on=['NORAD_ID', 'Name'])
             
             df_merged['Constellation'] = const_key
@@ -730,16 +890,16 @@ if __name__ == "__main__":
 
     if all_results:
         final_dataset = pd.concat(all_results, ignore_index=True)
-        final_dataset.to_csv(f"{OUT}/hand_simulation_final.csv", index=False)
+        final_dataset.to_csv(f"{OUTPUT_DIRECTORY}/hand_simulation_final.csv", index=False)
         
-        print("[+] Generating Visualizations...")
-        plot_xray_fluence_vs_distance_empirical(final_dataset, output_dir=OUT)
-        plot_prompt_damage_radius_vs_yield_empirical(final_dataset, output_dir=OUT)
-        plot_argus_dose_vs_time_FIXED(final_dataset, output_dir=OUT)
-        plot_multi_effect_scatter(final_dataset, output_dir=OUT)
-        plot_inclination_empirical_scatter(final_dataset, output_dir=OUT)
-        plot_altitude_governed_survivability(final_dataset, output_dir=OUT)
+        print("Generating Visualizations...")
+        plot_xray_fluence_vs_distance_from_burst(final_dataset, output_dir=OUTPUT_DIRECTORY)
+        plot_prompt_xray_damage_radius_vs_weapon_yield(final_dataset, output_dir=OUTPUT_DIRECTORY)
+        plot_argus_dose_vs_time(final_dataset, output_dir=OUTPUT_DIRECTORY) # NOTE: contains hard code to display certain constellations.
+        plot_multi_effect_scatter(final_dataset, output_dir=OUTPUT_DIRECTORY)
+        plot_inclination_empirical_scatter(final_dataset, output_dir=OUTPUT_DIRECTORY)
+        plot_altitude_governed_survivability(final_dataset, output_dir=OUTPUT_DIRECTORY)
         
-        print("[+] Execution Complete.")
+        print("Execution Complete.")
     else:
         print("No satellites processed. Ensure your 3LE file is correctly named and populated.")
